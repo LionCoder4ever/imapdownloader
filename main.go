@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
+	"time"
 
 	"github.com/emersion/go-imap/client"
 	log "github.com/sirupsen/logrus"
@@ -10,12 +12,13 @@ import (
 )
 
 func init() {
-	// log.SetFormatter(&log.Formatter())
-	log.SetOutput(os.Stdout)
-	file, err := os.OpenFile("logrus.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	log.SetFormatter(&log.TextFormatter{})
+	logFileName := "logrus-" + time.Now().Format("20060102150405") + ".log"
+	file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err == nil {
-		log.SetOutput(file)
+		log.SetOutput(io.MultiWriter(os.Stdout, file))
 	} else {
+		log.SetOutput(os.Stdout)
 		log.Info("Failed to log to file, using default stderr")
 	}
 	log.SetLevel(log.TraceLevel)
@@ -59,9 +62,22 @@ func DownloadByAccount(ctx context.Context, opts *Options) (err error) {
 	for _, mailbox := range mailboxes {
 		err := d.downloadAccountMailbox(ctx, mailbox)
 		if err != nil {
-			return err
+			log.Printf("文件夹%s下载出错：%s，跳过继续\n", mailbox, err.Error())
 		}
 	}
+
+	// 输出统计信息
+	log.Infof("\n\n======================================")
+	log.Infof("下载完成！")
+	log.Infof("已下载邮件总数：%d", d.downloadedCount)
+	log.Infof("跳过的邮件数：%d", len(d.skipedMails))
+	if len(d.skipedMails) > 0 {
+		log.Infof("跳过的邮件列表：")
+		for _, subject := range d.skipedMails {
+			log.Infof("  - %s", subject)
+		}
+	}
+	log.Infof("======================================\n\n")
 
 	return
 }

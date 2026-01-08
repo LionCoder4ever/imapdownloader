@@ -17,9 +17,11 @@ import (
 )
 
 type Downloader struct {
-	Client         *client.Client
-	Options        *Options
-	currentMailbox string
+	Client          *client.Client
+	Options         *Options
+	currentMailbox  string
+	downloadedCount int
+	skipedMails     []string
 }
 
 func NewDownloader(opts *Options) (d *Downloader, err error) {
@@ -69,7 +71,7 @@ func (d *Downloader) downloadAccountMailbox(ctx context.Context, mailbox string)
 		log.Infof("\n\n正在分析第%d批:[%d~%d]\n\n", i+1, start, end)
 		err = d.downloadMailsByRange(ctx, uint32(start), uint32(end))
 		if err != nil {
-			return
+			log.Errorf("第%d批[%d~%d]下载出错：%s，跳过继续\n", i+1, start, end, err.Error())
 		}
 	}
 	t2 := time.Since(t1)
@@ -184,7 +186,8 @@ func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (
 		case msg := <-chMsg:
 			if msg != nil {
 				if err = d.downloadMail(msg); err != nil {
-					return
+					log.Errorf("邮件%s下载出错：%s，跳过继续\n", msg.Envelope.Subject, err.Error())
+					d.skipedMails = append(d.skipedMails, msg.Envelope.Subject)
 				}
 			}
 		}
@@ -217,6 +220,7 @@ func (d *Downloader) downloadMail(msg *imap.Message) (err error) {
 	if _, err = io.Copy(f, r); err != nil {
 		return
 	}
+	d.downloadedCount++
 	return
 }
 
@@ -245,6 +249,9 @@ func (d *Downloader) getMailStorePath(msg *imap.Message) string {
 	subject = strings.Replace(subject, "\\", "", -1)
 	subject = strings.Replace(subject, "?", "", -1)
 	subject = strings.Replace(subject, "|", "", -1)
+	subject = strings.Replace(subject, "\t", "", -1)
+	subject = strings.Replace(subject, "\r", "", -1)
+	subject = strings.Replace(subject, "\n", "", -1)
 	dir := filepath.Join(d.Options.absDir, d.currentMailbox)
 	tid := fmt.Sprintf("%d", msg.Envelope.Date.UnixMilli())
 	return filepath.Join(dir, year, month, fmt.Sprintf("%s-%s.eml", subject, tid))
