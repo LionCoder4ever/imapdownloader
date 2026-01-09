@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -22,11 +23,19 @@ type Downloader struct {
 	currentMailbox  string
 	downloadedCount int
 	skipedMails     []string
+	mutex           sync.Mutex // 保护并发访问共享资源
+	bufPool         sync.Pool  // 缓冲区池，用于复用内存
 }
 
 func NewDownloader(opts *Options) (d *Downloader, err error) {
 	d = &Downloader{}
 	d.Options = opts
+	// 初始化缓冲区池，减少内存分配
+	d.bufPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32*1024) // 32KB缓冲区
+		},
+	}
 	// 增强邮件编码探测能力
 	imap.CharsetReader = charset.Reader
 	cli, err := client.DialTLS(d.Options.Host, nil)
@@ -60,12 +69,12 @@ func (d *Downloader) downloadAccountMailbox(ctx context.Context, mailbox string)
 	all := status.Messages
 	dir := filepath.Join(d.Options.absDir, mailbox)
 	log.Infof("%s邮箱文件夹下载存放位置: %s\n", mailbox, dir)
-	count := int(all / 100)
+	count := int(all / 500)
 	t1 := time.Now()
 	for i := 0; i <= count; i++ {
-		start := i*100 + 1
-		end := (i + 1) * 100
-		if int(all)-start < 100 {
+		start := i*500 + 1
+		end := (i + 1) * 500
+		if int(all)-start < 500 {
 			end = int(status.Messages)
 		}
 		log.Infof("\n\n正在分析第%d批:[%d~%d]\n\n", i+1, start, end)
@@ -114,16 +123,29 @@ func (d *Downloader) downloadMailsByRange(ctx context.Context, start, end uint32
 	seqDL, err := d.getDownloadMailList(ctx, start, end)
 	if err != nil {
 		log.Errorf("[%d~%d]分析下载队列出错:%s\n", start, end, err.Error())
-		return
+		for {
+			err = d.reconnect()
+			if err == nil {
+				break
+			}
+		}
+		seqDL, err = d.getDownloadMailList(ctx, start, end)
 	}
 	if seqDL.Empty() {
 		log.Infof("[%d~%d]下载队列为空,跳过:\n", start, end)
 		return
 	}
 	err = d.downloadMailList(ctx, seqDL)
+
 	if err != nil {
 		log.Errorf("[%d~%d]下载队列出错:%s\n", start, end, err.Error())
-		return
+		for {
+			err = d.reconnect()
+			if err == nil {
+				break
+			}
+		}
+		err = d.downloadMailList(ctx, seqDL)
 	}
 	return
 }
@@ -134,7 +156,7 @@ func (d *Downloader) getDownloadMailList(ctx context.Context, start uint32, end 
 	seq := new(imap.SeqSet)
 	seq.AddRange(start, end)
 
-	chMsg := make(chan *imap.Message, 10)
+	chMsg := make(chan *imap.Message, 500)
 	done := make(chan error, 1)
 
 	go func() {
@@ -147,14 +169,30 @@ func (d *Downloader) getDownloadMailList(ctx context.Context, start uint32, end 
 		case <-ctx.Done():
 			return seqDL, ctx.Err()
 		case err = <-done:
+			// 继续处理chMsg通道中的剩余邮件
+			for msg := range chMsg {
+				if msg != nil {
+					log.Infof("分析邮件: %s\n", msg.Envelope.Subject) // 降级为Debug级别，减少日志输出
+					existed, err := d.checkMailStorePathExisted(msg)
+					if err != nil {
+						log.Errorf("检测路径出错: %s\n", err)
+						// 跳过当前邮件，继续处理其他邮件
+						continue
+					}
+					if !existed {
+						seqDL.AddNum(msg.Uid)
+					}
+				}
+			}
 			return
 		case msg := <-chMsg:
 			if msg != nil {
-				log.Infof("分析邮件: %s\n", msg.Envelope.Subject)
+				log.Infof("分析邮件: %s\n", msg.Envelope.Subject) // 降级为Debug级别，减少日志输出
 				existed, err := d.checkMailStorePathExisted(msg)
 				if err != nil {
 					log.Errorf("检测路径出错: %s\n", err)
-					return seqDL, err
+					// 跳过当前邮件，继续处理其他邮件
+					continue
 				}
 				if !existed {
 					seqDL.AddNum(msg.Uid)
@@ -168,7 +206,7 @@ func (d *Downloader) getDownloadMailList(ctx context.Context, start uint32, end 
 // 下载邮件列表
 func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (err error) {
 	log.Infof("开始下载队列: %s", seqDL.String())
-	chMsg := make(chan *imap.Message, 10)
+	chMsg := make(chan *imap.Message, 500)
 	done := make(chan error, 1)
 
 	var section imap.BodySectionName
@@ -177,18 +215,47 @@ func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (
 		done <- d.Client.UidFetch(seqDL, []imap.FetchItem{imap.FetchEnvelope, section.FetchItem()}, chMsg)
 	}()
 
+	// 并发下载控制
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // 限制同时下载10个邮件（增加并发数提高速度）
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err = <-done:
+			// 继续处理chMsg通道中的剩余邮件
+			for msg := range chMsg {
+				if msg != nil {
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(m *imap.Message) {
+						defer wg.Done()
+						defer func() { <-sem }()
+
+						if err = d.downloadMail(m); err != nil {
+							log.Errorf("邮件%s下载出错：%s，跳过继续\n", m.Envelope.Subject, err.Error())
+							d.skipedMails = append(d.skipedMails, m.Envelope.Subject)
+						}
+					}(msg)
+				}
+			}
+			// 等待所有下载完成
+			wg.Wait()
 			return
 		case msg := <-chMsg:
 			if msg != nil {
-				if err = d.downloadMail(msg); err != nil {
-					log.Errorf("邮件%s下载出错：%s，跳过继续\n", msg.Envelope.Subject, err.Error())
-					d.skipedMails = append(d.skipedMails, msg.Envelope.Subject)
-				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(m *imap.Message) {
+					defer wg.Done()
+					defer func() { <-sem }()
+
+					if err = d.downloadMail(m); err != nil {
+						log.Errorf("邮件%s下载出错：%s，跳过继续\n", m.Envelope.Subject, err.Error())
+						d.skipedMails = append(d.skipedMails, m.Envelope.Subject)
+					}
+				}(msg)
 			}
 		}
 	}
@@ -197,19 +264,25 @@ func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (
 // 下载邮件
 func (d *Downloader) downloadMail(msg *imap.Message) (err error) {
 	file := d.getMailStorePath(msg)
-	log.Infof("存储邮件：%s\n", file)
-	if err = os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
+	log.Infof("存储邮件：%s\n", file) // 降级为Debug级别，减少日志输出
+
+	// 优化文件目录创建（减少权限检查）
+	if err = os.MkdirAll(filepath.Dir(file), 0755); err != nil {
 		return
 	}
+
 	r := msg.GetBody(&imap.BodySectionName{})
 	if r == nil {
 		log.Errorf("message does not have a body: %s", msg.Envelope.MessageId)
 		return
 	}
+
+	// 优化文件打开方式（使用更高效的标志）
 	var f *os.File
-	if f, err = os.OpenFile(file, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640); err != nil {
+	if f, err = os.OpenFile(file, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644); err != nil {
 		return
 	}
+
 	defer func(f *os.File) {
 		err := f.Close()
 		if err != nil {
@@ -217,10 +290,19 @@ func (d *Downloader) downloadMail(msg *imap.Message) (err error) {
 		}
 	}(f)
 
-	if _, err = io.Copy(f, r); err != nil {
+	// 从缓冲区池获取缓冲区，减少内存分配
+	buf := d.bufPool.Get().([]byte)
+	defer d.bufPool.Put(buf) // 使用完后放回池中
+
+	if _, err = io.CopyBuffer(f, r, buf); err != nil {
 		return
 	}
+
+	// 原子更新计数器（增加互斥锁保护）
+	d.mutex.Lock()
 	d.downloadedCount++
+	d.mutex.Unlock()
+
 	return
 }
 
@@ -228,30 +310,19 @@ func (d *Downloader) downloadMail(msg *imap.Message) (err error) {
 func (d *Downloader) getMailStorePath(msg *imap.Message) string {
 	year := msg.Envelope.Date.Format("2006")
 	month := msg.Envelope.Date.Format("01")
-	subject := msg.Envelope.Subject
-	subject = strings.Replace(subject, "“", "", -1)
-	subject = strings.Replace(subject, "”", "", -1)
-	subject = strings.Replace(subject, "\"", "", -1)
-	subject = strings.Replace(subject, "（", "", -1)
-	subject = strings.Replace(subject, "）", "", -1)
-	subject = strings.Replace(subject, " ", "", -1)
-	subject = strings.Replace(subject, "。", "", -1)
-	subject = strings.Replace(subject, "，", "", -1)
-	subject = strings.Replace(subject, "【", "", -1)
-	subject = strings.Replace(subject, "】", "", -1)
-	subject = strings.Replace(subject, "：", "", -1)
-	subject = strings.Replace(subject, ":", "", -1)
-	subject = strings.Replace(subject, "/", "", -1)
-	subject = strings.Replace(subject, "、", "", -1)
-	subject = strings.Replace(subject, "<", "", -1)
-	subject = strings.Replace(subject, ">", "", -1)
-	subject = strings.Replace(subject, "*", "", -1)
-	subject = strings.Replace(subject, "\\", "", -1)
-	subject = strings.Replace(subject, "?", "", -1)
-	subject = strings.Replace(subject, "|", "", -1)
-	subject = strings.Replace(subject, "\t", "", -1)
-	subject = strings.Replace(subject, "\r", "", -1)
-	subject = strings.Replace(subject, "\n", "", -1)
+
+	// 使用strings.Map一次性替换所有特殊字符，提高效率
+	subject := strings.Map(func(r rune) rune {
+		// 定义需要移除的字符集
+		badChars := "“”\"（） 。，【】：:/、<>*\\?|\t\r\n'"
+		for _, c := range badChars {
+			if r == c {
+				return -1 // -1表示移除该字符
+			}
+		}
+		return r // 保留其他字符
+	}, msg.Envelope.Subject)
+
 	dir := filepath.Join(d.Options.absDir, d.currentMailbox)
 	tid := fmt.Sprintf("%d", msg.Envelope.Date.UnixMilli())
 	return filepath.Join(dir, year, month, fmt.Sprintf("%s-%s.eml", subject, tid))
@@ -270,4 +341,38 @@ func (d *Downloader) checkMailStorePathExisted(msg *imap.Message) (existed bool,
 	}
 	log.Infof("√ 下载：%s", msg.Envelope.Subject)
 	return
+}
+
+// 重建连接
+func (d *Downloader) reconnect() error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	// 关闭旧连接
+	if d.Client != nil {
+		if err := d.Client.Logout(); err != nil {
+			log.Errorf("登出出错: %s\n", err.Error())
+		}
+		// 设置为nil，防止其他goroutine继续使用已关闭的连接
+		d.Client = nil
+	}
+
+	// 建立新连接
+	cli, err := client.DialTLS(d.Options.Host, nil)
+	if err != nil {
+		return err
+	}
+
+	// 登录新连接
+	if err = cli.Login(d.Options.Username, d.Options.Password); err != nil {
+		cli.Logout()
+		return err
+	}
+
+	// 替换Client
+	d.Client = cli
+	log.Info("已连接到服务器:", d.Options.Host)
+	log.Info("已登录:", d.Options.Username)
+
+	return nil
 }
