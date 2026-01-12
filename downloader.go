@@ -172,11 +172,10 @@ func (d *Downloader) getDownloadMailList(ctx context.Context, start uint32, end 
 			// 继续处理chMsg通道中的剩余邮件
 			for msg := range chMsg {
 				if msg != nil {
-					log.Infof("分析邮件: %s\n", msg.Envelope.Subject) // 降级为Debug级别，减少日志输出
+					log.Infof("分析邮件: %s\n", msg.Envelope.Subject)
 					existed, err := d.checkMailStorePathExisted(msg)
 					if err != nil {
 						log.Errorf("检测路径出错: %s\n", err)
-						// 跳过当前邮件，继续处理其他邮件
 						continue
 					}
 					if !existed {
@@ -187,7 +186,12 @@ func (d *Downloader) getDownloadMailList(ctx context.Context, start uint32, end 
 			return
 		case msg := <-chMsg:
 			if msg != nil {
-				log.Infof("分析邮件: %s\n", msg.Envelope.Subject) // 降级为Debug级别，减少日志输出
+				log.Infof("分析邮件: %s\n", msg.Envelope.Subject)
+				// 跳过INBOX文件夹中2023年12月份的邮件
+				// if d.currentMailbox == "INBOX" && msg.Envelope.Date.Year() == 2023 && msg.Envelope.Date.Month() == time.December {
+				// 	log.Infof("跳过INBOX 2023年12月邮件: %s\n", msg.Envelope.Subject)
+				// 	continue
+				// }
 				existed, err := d.checkMailStorePathExisted(msg)
 				if err != nil {
 					log.Errorf("检测路径出错: %s\n", err)
@@ -235,7 +239,9 @@ func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (
 
 						if err = d.downloadMail(m); err != nil {
 							log.Errorf("邮件%s下载出错：%s，跳过继续\n", m.Envelope.Subject, err.Error())
+							d.mutex.Lock()
 							d.skipedMails = append(d.skipedMails, m.Envelope.Subject)
+							d.mutex.Unlock()
 						}
 					}(msg)
 				}
@@ -253,7 +259,9 @@ func (d *Downloader) downloadMailList(ctx context.Context, seqDL *imap.SeqSet) (
 
 					if err = d.downloadMail(m); err != nil {
 						log.Errorf("邮件%s下载出错：%s，跳过继续\n", m.Envelope.Subject, err.Error())
+						d.mutex.Lock()
 						d.skipedMails = append(d.skipedMails, m.Envelope.Subject)
+						d.mutex.Unlock()
 					}
 				}(msg)
 			}
@@ -345,34 +353,70 @@ func (d *Downloader) checkMailStorePathExisted(msg *imap.Message) (existed bool,
 
 // 重建连接
 func (d *Downloader) reconnect() error {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
+	maxRetries := 5
+	baseDelay := 30 * time.Second
+	maxDelay := 5 * time.Minute
 
-	// 关闭旧连接
-	if d.Client != nil {
-		if err := d.Client.Logout(); err != nil {
-			log.Errorf("登出出错: %s\n", err.Error())
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			delay := time.Duration(int(baseDelay) * (1 << uint(retry-1)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			log.Infof("等待 %v 后重试连接 (第 %d/%d 次)", delay, retry, maxRetries)
+			time.Sleep(delay)
 		}
-		// 设置为nil，防止其他goroutine继续使用已关闭的连接
-		d.Client = nil
+
+		log.Infof("正在重新连接到服务器...")
+		d.mutex.Lock()
+
+		log.Infof("销毁旧连接")
+		// 关闭旧连接（如果存在）
+		if d.Client != nil {
+			_ = d.Client.Logout() // 忽略注销错误
+			d.Client = nil
+		}
+
+		// 建立新连接
+		cli, err := client.DialTLS(d.Options.Host, nil)
+		if err != nil {
+			log.Errorf("重新连接服务器失败:%s\n", err.Error())
+			d.mutex.Unlock()
+			if retry == maxRetries-1 {
+				return err
+			}
+			continue
+		}
+
+		// 登录新连接
+		if err = cli.Login(d.Options.Username, d.Options.Password); err != nil {
+			log.Errorf("重新登录失败:%s\n", err.Error())
+			cli.Logout()
+			d.mutex.Unlock()
+			if retry == maxRetries-1 {
+				return err
+			}
+			continue
+		}
+
+		// 重新选择当前邮箱
+		if d.currentMailbox != "" {
+			if _, err = cli.Select(d.currentMailbox, true); err != nil {
+				log.Errorf("重新选择邮箱失败:%s\n", err.Error())
+				cli.Logout()
+				d.mutex.Unlock()
+				if retry == maxRetries-1 {
+					return err
+				}
+				continue
+			}
+		}
+
+		d.Client = cli
+		d.mutex.Unlock()
+		log.Infof("重新连接成功")
+		return nil
 	}
 
-	// 建立新连接
-	cli, err := client.DialTLS(d.Options.Host, nil)
-	if err != nil {
-		return err
-	}
-
-	// 登录新连接
-	if err = cli.Login(d.Options.Username, d.Options.Password); err != nil {
-		cli.Logout()
-		return err
-	}
-
-	// 替换Client
-	d.Client = cli
-	log.Info("已连接到服务器:", d.Options.Host)
-	log.Info("已登录:", d.Options.Username)
-
-	return nil
+	return fmt.Errorf("重连失败：已达到最大重试次数 %d", maxRetries)
 }
